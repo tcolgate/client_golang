@@ -33,12 +33,11 @@ import (
 	"strings"
 	"sync"
 
-	"bitbucket.org/ww/goautoneg"
 	"github.com/golang/protobuf/proto"
 
 	dto "github.com/prometheus/client_model/go"
 
-	"github.com/prometheus/client_golang/text"
+	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 )
 
@@ -49,25 +48,6 @@ var (
 
 // Constants relevant to the HTTP interface.
 const (
-	// APIVersion is the version of the format of the exported data.  This
-	// will match this library's version, which subscribes to the Semantic
-	// Versioning scheme.
-	APIVersion = "0.0.4"
-
-	// DelimitedTelemetryContentType is the content type set on telemetry
-	// data responses in delimited protobuf format.
-	DelimitedTelemetryContentType = `application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited`
-	// TextTelemetryContentType is the content type set on telemetry data
-	// responses in text format.
-	TextTelemetryContentType = `text/plain; version=` + APIVersion
-	// ProtoTextTelemetryContentType is the content type set on telemetry
-	// data responses in protobuf text format.  (Only used for debugging.)
-	ProtoTextTelemetryContentType = `application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=text`
-	// ProtoCompactTextTelemetryContentType is the content type set on
-	// telemetry data responses in protobuf compact text format.  (Only used
-	// for debugging.)
-	ProtoCompactTextTelemetryContentType = `application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=compact-text`
-
 	// Constants for object pools.
 	numBufs           = 4
 	numMetricFamilies = 1000
@@ -77,12 +57,12 @@ const (
 	capMetricChan = 1000
 	capDescChan   = 10
 
-	contentTypeHeader     = "Content-Type"
-	contentLengthHeader   = "Content-Length"
-	contentEncodingHeader = "Content-Encoding"
+	hdrcontentType     = "Content-Type"
+	hdrcontentLength   = "Content-Length"
+	hdrcontentEncoding = "Content-Encoding"
 
-	acceptEncodingHeader = "Accept-Encoding"
-	acceptHeader         = "Accept"
+	hdracceptEncoding = "Accept-Encoding"
+	hdraccept         = "Accept"
 )
 
 // Handler returns the HTTP handler for the global Prometheus registry. It is
@@ -346,7 +326,7 @@ func (r *registry) Push(job, instance, pushURL, method string) error {
 	}
 	buf := r.getBuf()
 	defer r.giveBuf(buf)
-	if _, err := r.writePB(buf, text.WriteProtoDelimited); err != nil {
+	if err := r.writePB(expfmt.NewEncoder(buf, expfmt.FmtProtoDelim)); err != nil {
 		if r.panicOnCollectError {
 			panic(err)
 		}
@@ -356,7 +336,7 @@ func (r *registry) Push(job, instance, pushURL, method string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set(contentTypeHeader, DelimitedTelemetryContentType)
+	req.Header.Set(hdrcontentType, string(expfmt.FmtProtoDelim))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
@@ -369,30 +349,32 @@ func (r *registry) Push(job, instance, pushURL, method string) error {
 }
 
 func (r *registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	enc, contentType := chooseEncoder(req)
 	buf := r.getBuf()
 	defer r.giveBuf(buf)
-	writer, encoding := decorateWriter(req, buf)
-	if _, err := r.writePB(writer, enc); err != nil {
+
+	wr, encoding := decorateWriter(req, buf)
+	format := expfmt.Negotiate(req.Header)
+
+	if err := r.writePB(expfmt.NewEncoder(wr, format)); err != nil {
 		if r.panicOnCollectError {
 			panic(err)
 		}
 		http.Error(w, "An error has occurred:\n\n"+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if closer, ok := writer.(io.Closer); ok {
+	if closer, ok := wr.(io.Closer); ok {
 		closer.Close()
 	}
 	header := w.Header()
-	header.Set(contentTypeHeader, contentType)
-	header.Set(contentLengthHeader, fmt.Sprint(buf.Len()))
+	header.Set(hdrcontentType, string(format))
+	header.Set(hdrcontentLength, fmt.Sprint(buf.Len()))
 	if encoding != "" {
-		header.Set(contentEncodingHeader, encoding)
+		header.Set(hdrcontentEncoding, encoding)
 	}
 	w.Write(buf.Bytes())
 }
 
-func (r *registry) writePB(w io.Writer, writeEncoded encoder) (int, error) {
+func (r *registry) writePB(enc expfmt.Encoder) error {
 	var metricHashes map[uint64]struct{}
 	if r.collectChecksEnabled {
 		metricHashes = make(map[uint64]struct{})
@@ -444,7 +426,7 @@ func (r *registry) writePB(w io.Writer, writeEncoded encoder) (int, error) {
 			// TODO: Consider different means of error reporting so
 			// that a single erroneous metric could be skipped
 			// instead of blowing up the whole collection.
-			return 0, fmt.Errorf("error collecting metric %v: %s", desc, err)
+			return fmt.Errorf("error collecting metric %v: %s", desc, err)
 		}
 		switch {
 		case metricFamily.Type != nil:
@@ -460,11 +442,11 @@ func (r *registry) writePB(w io.Writer, writeEncoded encoder) (int, error) {
 		case dtoMetric.Histogram != nil:
 			metricFamily.Type = dto.MetricType_HISTOGRAM.Enum()
 		default:
-			return 0, fmt.Errorf("empty metric collected: %s", dtoMetric)
+			return fmt.Errorf("empty metric collected: %s", dtoMetric)
 		}
 		if r.collectChecksEnabled {
 			if err := r.checkConsistency(metricFamily, dtoMetric, desc, metricHashes); err != nil {
-				return 0, err
+				return err
 			}
 		}
 		metricFamily.Metric = append(metricFamily.Metric, dtoMetric)
@@ -478,7 +460,7 @@ func (r *registry) writePB(w io.Writer, writeEncoded encoder) (int, error) {
 				if r.collectChecksEnabled {
 					for _, m := range mf.Metric {
 						if err := r.checkConsistency(mf, m, nil, metricHashes); err != nil {
-							return 0, err
+							return err
 						}
 					}
 				}
@@ -487,7 +469,7 @@ func (r *registry) writePB(w io.Writer, writeEncoded encoder) (int, error) {
 			for _, m := range mf.Metric {
 				if r.collectChecksEnabled {
 					if err := r.checkConsistency(existingMF, m, nil, metricHashes); err != nil {
-						return 0, err
+						return err
 					}
 				}
 				existingMF.Metric = append(existingMF.Metric, m)
@@ -508,15 +490,12 @@ func (r *registry) writePB(w io.Writer, writeEncoded encoder) (int, error) {
 	}
 	sort.Strings(names)
 
-	var written int
 	for _, name := range names {
-		w, err := writeEncoded(w, metricFamiliesByName[name])
-		written += w
-		if err != nil {
-			return written, err
+		if err := enc.Encode(metricFamiliesByName[name]); err != nil {
+			return err
 		}
 	}
-	return written, nil
+	return nil
 }
 
 func (r *registry) checkConsistency(metricFamily *dto.MetricFamily, dtoMetric *dto.Metric, desc *Desc, metricHashes map[uint64]struct{}) error {
@@ -686,39 +665,11 @@ func newDefaultRegistry() *registry {
 	return r
 }
 
-func chooseEncoder(req *http.Request) (encoder, string) {
-	accepts := goautoneg.ParseAccept(req.Header.Get(acceptHeader))
-	for _, accept := range accepts {
-		switch {
-		case accept.Type == "application" &&
-			accept.SubType == "vnd.google.protobuf" &&
-			accept.Params["proto"] == "io.prometheus.client.MetricFamily":
-			switch accept.Params["encoding"] {
-			case "delimited":
-				return text.WriteProtoDelimited, DelimitedTelemetryContentType
-			case "text":
-				return text.WriteProtoText, ProtoTextTelemetryContentType
-			case "compact-text":
-				return text.WriteProtoCompactText, ProtoCompactTextTelemetryContentType
-			default:
-				continue
-			}
-		case accept.Type == "text" &&
-			accept.SubType == "plain" &&
-			(accept.Params["version"] == "0.0.4" || accept.Params["version"] == ""):
-			return text.MetricFamilyToText, TextTelemetryContentType
-		default:
-			continue
-		}
-	}
-	return text.MetricFamilyToText, TextTelemetryContentType
-}
-
 // decorateWriter wraps a writer to handle gzip compression if requested.  It
 // returns the decorated writer and the appropriate "Content-Encoding" header
 // (which is empty if no compression is enabled).
 func decorateWriter(request *http.Request, writer io.Writer) (io.Writer, string) {
-	header := request.Header.Get(acceptEncodingHeader)
+	header := request.Header.Get(hdracceptEncoding)
 	parts := strings.Split(header, ",")
 	for _, part := range parts {
 		part := strings.TrimSpace(part)
